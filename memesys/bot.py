@@ -1,84 +1,148 @@
 from dotenv import load_dotenv
 load_dotenv()
 
-import asyncio
+import base64
 import os
 from io import BytesIO
 from typing import Final
 
-from fire import Fire
 from loguru import logger
-from telegram import Bot, Update
-from telegram.ext import Updater, CommandHandler, MessageHandler, filters, Application, PicklePersistence
+from telegram import Update
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    filters,
+    ContextTypes,
+)
+from openai import OpenAI
 
-from gpt_api import chat_gpt_description
-from memesys.db import save_image, search_image
-
+from memesys.db import create_tables, save_image, search_image
 
 TG_BOT_TOKEN: Final[str] = os.getenv("TG_BOT_TOKEN")
-UPDATE_QUEUE: Final[asyncio.Queue] = asyncio.Queue()
-# JOB_QUEUE: Final[asyncio.Queue] = asyncio.Queue()
-BOT_INSTANCE: Final[Bot] = Bot(TG_BOT_TOKEN)
-PERSISTENCE: Final[PicklePersistence] = PicklePersistence(filepath="bot_persistence.pkl")
-UPDATER: Final[Updater] = Updater(bot=BOT_INSTANCE, update_queue=UPDATE_QUEUE)
-APPLICATION: Final[Application] = (
-    Application
-    .builder()
-    .updater(UPDATER)
-    .build()
-)
+if not TG_BOT_TOKEN:
+    raise ValueError("TG_BOT_TOKEN environment variable is not set")
+
+OPENAI_CLIENT = OpenAI()
 
 
-async def start(update, context):
-    """Send a message when the command /start is issued."""
-    await update.message.reply_text('Hi! Send me a picture and I will save it.')
+def encode_image(image_data: BytesIO) -> str:
+    """Convert image data to base64 string."""
+    return base64.b64encode(image_data.getvalue()).decode('utf-8')
 
 
-async def process_photo(
-        update: Update,
-        context,
-):
-    """Save photo sent by the user."""
-    photo_file = await update.message.photo[-1].get_file()
-    io = BytesIO()
-    await photo_file.download_to_memory(io)
-    text = await chat_gpt_description(io)
+def get_image_description(image_data: BytesIO) -> str:
+    """Get image description from GPT-4 Vision."""
+    base64_image = encode_image(image_data)
 
-    link = f'https://t.me/c/{update.message.chat.id}/{update.message.id}'
-
-    await save_image(
-        data=io.getvalue(),
-        text=text,
-        link=link,
+    response = OPENAI_CLIENT.chat.completions.create(
+        model="gpt-4-vision-preview",
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            "What's in this image? "
+                            "Produce only semantic search terms which can be used to look for this image. "
+                            "Mention the objects, people, places, actions, activities, "
+                            "colors and text in the image. "
+                            "Create terms in english and then in russian language."
+                        )
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/jpeg;base64,{base64_image}"
+                        }
+                    },
+                ],
+            },
+        ],
+        max_tokens=300,
     )
 
-    await update.message.reply_text(text)
-
-async def search_meme(
-        update: Update,
-        context,
-):
-    """Search for meme."""
-    text = update.message.text
-    results = await search_image(text.removeprefix("/search_all").strip())
-    await update.message.reply_text(str(results))
+    return str(response.choices[0].message.content)
 
 
-async def error(update, context):
-    """Log Errors caused by Updates."""
-    logger.warning(f'Update {update} caused error {context.error}')
+def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send a message when the command /start is issued."""
+    update.message.reply_text(
+        'Hi! Send me a picture to save it for searching, or use /search_all to find memes.'
+    )
+
+
+def process_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Save photo with its description for future search."""
+    try:
+        photo_file = update.message.photo[-1].get_file()
+        image_data = BytesIO()
+        photo_file.download_to_memory(image_data)
+
+        description = get_image_description(image_data)
+        link = f'https://t.me/c/{update.message.chat.id}/{update.message.id}'
+
+        save_image(
+            data=image_data.getvalue(),
+            text=description,
+            link=link,
+        )
+
+        update.message.reply_text(
+            "✅ Meme saved with description:\n\n" + description
+        )
+    except Exception as e:
+        logger.exception("Error processing photo")
+        update.message.reply_text(
+            "❌ An error occurred while processing your image."
+        )
+
+
+def search_meme(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Search for memes by description."""
+    search_query = update.message.text.removeprefix("/search_all").strip()
+    if not search_query:
+        update.message.reply_text(
+            "Please provide search terms after /search_all command"
+        )
+        return
+
+    try:
+        results = search_image(search_query)
+        if not results:
+            update.message.reply_text("No memes found matching your search terms")
+            return
+
+        response = "Found memes:\n\n" + "\n\n".join(
+            f"🔗 {result.telegram_image_link}\n📝 {result.recognized_search_terms}"
+            for result in results
+        )
+        update.message.reply_text(response)
+    except Exception as e:
+        logger.exception("Error searching memes")
+        update.message.reply_text(
+            "❌ An error occurred while searching. Please try again later."
+        )
 
 
 def main():
-    # Register handlers
-    APPLICATION.add_handler(CommandHandler("start", start))
-    APPLICATION.add_handler(CommandHandler("search_all", search_meme))
-    APPLICATION.add_handler(MessageHandler(filters.PHOTO, process_photo))
-    APPLICATION.add_error_handler(error)
+    """Start the bot."""
+    # Initialize database
+    create_tables()
 
-    # Start the Bot
-    APPLICATION.run_polling(allowed_updates=Update.ALL_TYPES)
+    # Create application
+    application = ApplicationBuilder().token(TG_BOT_TOKEN).build()
+
+    # Add handlers
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("search_all", search_meme))
+    application.add_handler(MessageHandler(filters.PHOTO, process_photo))
+
+    # Start polling
+    logger.info("Starting bot...")
+    application.run_polling()
 
 
-if __name__ == '__main__':
-    Fire(main)
+if __name__ == "__main__":
+    main()

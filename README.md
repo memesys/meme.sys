@@ -19,11 +19,15 @@ Search your memes library, always have any meme you need at the tips of the fing
    python -m venv .venv
    source .venv/bin/activate  # On Windows use: .venv\Scripts\activate
    ```
-3. Setup .env file:
+
+3. Setup environment variables:
    ```bash
    cp .env.template .env
    ```
-   Fill in the .env file with your api keys.
+   Edit `.env` file and set:
+   - `TG_BOT_TOKEN`: Get from [@BotFather](https://t.me/BotFather)
+   - `OPENAI_API_KEY`: Get from [OpenAI Platform](https://platform.openai.com/api-keys)
+   - `DATABASE_URI`: (Optional) Database connection string
 
 4. Choose one of the installation methods:
 
@@ -46,19 +50,42 @@ pip install .  # Install package from current directory
 For development installation (with either pip or uv):
 ```bash
 # Using pip
-pip install -e .
+pip install -r requirements.txt -e .
 
 # OR using uv
-uv pip install -e .
+uv pip install -r requirements.txt -e .
 ```
 
 # Usage
 After installation, you can run the bot using:
-```bash
-memesys
-```
 
-Or using Python directly:
 ```bash
 python -m memesys.bot
 ```
+
+# Database Configuration
+By default, the bot uses SQLite database stored in `memes.db` file. To use PostgreSQL:
+
+1. Install PostgreSQL and create a database
+2. Set `DATABASE_URI` in `.env`:
+   ```
+   DATABASE_URI=postgresql+asyncpg://user:password@host:port/dbname
+   ```
+
+# Bot Commands
+- `/start` - Start the bot and get welcome message
+- `/search_all <terms>` - Search for memes by description
+- Send any image to save it with searchable description
+
+# Troubleshooting
+1. If you get "TG_BOT_TOKEN environment variable is not set" error:
+   - Make sure you copied `.env.template` to `.env`
+   - Make sure you set valid Telegram bot token in `.env`
+
+2. If you get OpenAI API errors:
+   - Check if your OpenAI API key is valid
+   - Make sure you have enough credits
+
+3. For database errors:
+   - Check if DATABASE_URI is correct
+   - For PostgreSQL, make sure the database exists and is accessible

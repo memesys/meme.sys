@@ -1,91 +1,81 @@
-import asyncio
 import hashlib
 import os
-from typing import Final, AsyncGenerator
+from typing import Final, List
 
-from sqlalchemy import Column, String, JSON, cast, select
-from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
-from sqlalchemy.ext.declarative import declarative_base
+from loguru import logger
+from sqlalchemy import Column, String, JSON, create_engine, cast, select, text
+from sqlalchemy.orm import declarative_base, sessionmaker
+from sqlalchemy.pool import StaticPool
 
-DATABASE_URI: Final[str] = os.environ.get("DATABASE_URI")
+# Make sure we're using the standard SQLite dialect
+if os.environ.get("DATABASE_URI"):
+    DATABASE_URI: Final[str] = os.environ["DATABASE_URI"]
+else:
+    # Use standard sqlite:// instead of sqlite+aiosqlite://
+    DATABASE_URI: Final[str] = "sqlite:///memes.db"
 
-engine = create_async_engine(
+engine = create_engine(
     DATABASE_URI,
-    future=True,
-    echo=True,
+    connect_args={"check_same_thread": False},
+    poolclass=StaticPool,
+    # Enable SQLite foreign key support
+    creator=lambda: __import__('sqlite3').connect('memes.db', isolation_level=None)
 )
 
 Base = declarative_base()
+Session = sessionmaker(bind=engine)
 
-# expire_on_commit=False will prevent attributes from being expired
-# after commit.
-AsyncSessionFactory = async_sessionmaker(
-    engine,
-    autoflush=False,
-    expire_on_commit=False,
-)
 
 class RecognisedImage(Base):
+    """Model for storing recognized images and their metadata."""
     __tablename__ = 'recognised_images'
+
     image_hash = Column(String, primary_key=True, unique=True)
-    telegram_image_link = Column(String)
-    recognized_search_terms = Column(JSON)
+    telegram_image_link = Column(String, nullable=False)
+    recognized_search_terms = Column(JSON, nullable=False)
 
-    def __repr__(self):
-       return (
-           f"<RecognisedImage("
-           f"image_hash={self.image_hash}, "
-           f"telegram_image_link={self.telegram_image_link}, "
-           f"recognized_search_terms={self.recognized_search_terms})>"
-       )
-
-# Initialization block
-async def create_tables():
-    async with engine.begin() as conn:
-        # Use run_sync to run synchronous code in async context
-        await conn.run_sync(Base.metadata.create_all)
-
-async def search_image(text: str) -> list:
-    async with AsyncSessionFactory() as session:
-        # Prepare the query
-        stmt = select(
-            # RecognisedImage,
-            RecognisedImage.telegram_image_link,
-        ).filter(
-            cast(RecognisedImage.recognized_search_terms, String).contains(text)
+    def __repr__(self) -> str:
+        return (
+            f"<RecognisedImage("
+            f"link={self.telegram_image_link}, "
+            f"terms={self.recognized_search_terms})>"
         )
-        results = await session.execute(stmt)
-        recognised_images = results.scalars().all()
-        return list(recognised_images)
 
-async def save_image(
-        data: bytes,
-        text: str,
-        link: str,
-) -> None:
-    # SHA3-512
-    hash_object_512 = hashlib.sha3_512()
-    hash_object_512.update(data)
-    img_hash = hash_object_512.hexdigest()
 
-    new_img = RecognisedImage(
-        image_hash=img_hash,
-        telegram_image_link=link,
-        recognized_search_terms={'service1': text}
-    )
+def create_tables() -> None:
+    """Initialize database tables."""
+    Base.metadata.create_all(engine)
+    logger.info("Database tables created")
 
-    try:
-        async with AsyncSessionFactory() as session:
-            session.add(new_img)
-            await session.commit()
-    except:
-        print("already exists")
 
-async def main():
-    await create_tables()
-    await save_image(b'123', 'term1', 'link1')
+def save_image(data: bytes, text: str, link: str) -> None:
+    """Save image data and metadata to database."""
+    image_hash = hashlib.sha256(data).hexdigest()
 
-    print(await search_image('term1'))
+    with Session() as session:
+        try:
+            image = RecognisedImage(
+                image_hash=image_hash,
+                telegram_image_link=link,
+                recognized_search_terms=text
+            )
+            session.add(image)
+            session.commit()
+            logger.debug(f"Saved image {image_hash}")
+        except Exception as e:
+            session.rollback()
+            logger.error(f"Error saving image: {e}")
+            raise
 
-if __name__ == '__main__':
-    asyncio.run(main())
+
+def search_image(search_text: str) -> List[RecognisedImage]:
+    """Search for images by text in their recognized terms."""
+    with Session() as session:
+        try:
+            query = select(RecognisedImage).where(
+                cast(RecognisedImage.recognized_search_terms, String).contains(search_text)
+            )
+            return session.execute(query).scalars().all()
+        except Exception as e:
+            logger.error(f"Error searching images: {e}")
+            raise
